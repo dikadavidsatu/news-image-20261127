@@ -1,67 +1,80 @@
-// main.ts — delivery program for "The World Today — One Image Edition",
-// the make.fun entry for news-image-20261127 ("Sum up 27 November's
-// world news in one image").
+// main.ts — the hand-off program for the 27 November 2026 edition of
+// "The World Today — One Image Edition", entered in make.fun's
+// news-image-20261127 ("Sum up 27 November's world news in one image").
 //
-// What the grader runs is this file. The artwork itself — a 1024x1024
-// broadsheet front page carrying 33 stories from Thursday 27 November
-// 2026 — is committed beside it as entry.png, rendered offline by
-// render.py from the researched headlines in headlines.json. Rendering
-// is deliberately NOT done here: the grading sandbox mounts this
-// repository read-only and offers no network, fonts package or Python,
-// so the only safe job left at run time is delivery.
+// The picture is already finished before this program ever runs:
+// entry.png, sitting beside this file, is a 1024x1024 broadsheet front
+// page that packs a whole day of wire news — 33 stories — into a
+// single frame. The lead reports Washington's plan for fresh tariffs
+// aimed at 14 trading partners; the second story covers the drone
+// strike in Kuwait that killed two Italian technicians; the rest of
+// the day fills the columns below them. render.py drew the page
+// offline, ahead of time, because the grading sandbox gives this
+// program no network, no fonts and no Python — and mounts the
+// repository read-only besides.
 //
-// Delivery contract:
-//   1. Find the committed entry.png (next to this file; the working
-//      directory is the fallback).
-//   2. Resolve the output folder: $MAKEFUN_OUTPUT_DIR when the harness
-//      sets it, else /output when that exists, else ./output.
-//   3. Copy the image into that folder TWICE, and after each copy read
-//      the landed file back and verify it byte-for-byte against the
-//      committed original (length + SHA-256). The second, verified copy
-//      is the file the harness grades, so a torn or truncated first
-//      write can never be what gets judged.
-//   4. Write NOTHING anywhere else — in particular, never into the
-//      repository, which may be mounted read-only.
+// So delivery is the only job left, and this program keeps it as
+// plain as possible: straight-line, fully synchronous code, nothing
+// but node:fs sync calls and a SHA-256 from node:crypto.
 //
-// The program is deterministic: same repository in, same bytes out,
-// no clocks, no randomness, no network. It exits non-zero if any
-// verification fails, rather than delivering a corrupted front page.
+//   * The PNG is located (beside this script first, then the working
+//     directory, then /bot) and read into memory exactly once. Its
+//     byte length and SHA-256 are the reference every later check
+//     compares against.
+//   * The destination folder is $MAKEFUN_OUTPUT_DIR when that is set
+//     to something non-empty, otherwise /output when it exists,
+//     otherwise an "output" folder under the working directory.
+//   * The in-memory bytes are written to <folder>/entry.png TWICE.
+//     After each write the landed file is read back and checked —
+//     same length, same hash — so the copy the grader eventually
+//     opens is the second write, already proven identical. A torn
+//     first write can never be what gets judged.
+//   * Nothing is written anywhere else. The repository stays
+//     untouched, which matters because it may be read-only.
+//
+// Any failure along the way throws, is caught at the bottom, and
+// ends the process with exit code 1: a broken delivery must be loud,
+// never a quietly corrupted front page.
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const IMAGE_NAME = "entry.png";
+const PAGE_FILE = "entry.png";
 
-/** SHA-256 of a buffer, hex-encoded — the fingerprint we verify with. */
-function sha256(bytes: Buffer): string {
+/** Hex SHA-256 fingerprint of a buffer. */
+function fingerprint(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
- * Locate the committed entry.png. The canonical home is the directory
- * containing this file (the repository root); if the harness copied
- * the program elsewhere, fall back to the working directory.
+ * Where the committed page lives. The script's own directory is the
+ * normal case; the working directory and /bot are the fallbacks for
+ * harnesses that invoke the program from somewhere else.
  */
-function findSourceImage(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const beside = join(here, IMAGE_NAME);
-  if (existsSync(beside)) return beside;
-  const inCwd = join(process.cwd(), IMAGE_NAME);
-  if (existsSync(inCwd)) return inCwd;
+function locatePage(): string {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(scriptDir, PAGE_FILE),
+    join(process.cwd(), PAGE_FILE),
+    join("/bot", PAGE_FILE),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
   throw new Error(
-    `cannot find ${IMAGE_NAME}: looked in ${here} and ${process.cwd()}`,
+    `entry.png not found; tried ${candidates.join(", ")}`,
   );
 }
 
-/**
- * Resolve the output folder exactly as the harness contract states:
- * MAKEFUN_OUTPUT_DIR first, then /output, then ./output relative to
- * the working directory.
- */
-function resolveOutputDir(): string {
+/** The folder the harness wants the page delivered into. */
+function outputFolder(): string {
   const fromEnv = process.env.MAKEFUN_OUTPUT_DIR;
   if (fromEnv && fromEnv.trim().length > 0) return resolve(fromEnv);
   if (existsSync("/output")) return "/output";
@@ -69,70 +82,62 @@ function resolveOutputDir(): string {
 }
 
 /**
- * Copy source -> target once, then prove the landed file is the same
- * bytes as the source: equal length and equal SHA-256. Throws on any
- * mismatch so main() can fail the run loudly.
+ * Write the page bytes to the target, then read the file back and
+ * prove it is the same page: identical length and identical SHA-256.
  */
-async function copyAndVerify(
-  source: string,
+function writeAndProve(
+  pageBytes: Buffer,
+  pageHash: string,
   target: string,
-  expectedHash: string,
-  expectedSize: number,
-  passLabel: string,
-): Promise<void> {
-  await copyFile(source, target);
-  const landed = await readFile(target);
-  const landedInfo = await stat(target);
-  if (landed.length !== expectedSize || landedInfo.size !== expectedSize) {
+  passName: string,
+): void {
+  writeFileSync(target, pageBytes);
+  const landed = readFileSync(target);
+  if (landed.length !== pageBytes.length) {
     throw new Error(
-      `${passLabel}: size mismatch — expected ${expectedSize} bytes, ` +
-        `landed ${landed.length}`,
+      `${passName}: wrote ${pageBytes.length} bytes but read back ` +
+        `${landed.length}`,
     );
   }
-  const landedHash = sha256(landed);
-  if (landedHash !== expectedHash) {
-    throw new Error(
-      `${passLabel}: sha256 mismatch — expected ${expectedHash}, ` +
-        `landed ${landedHash}`,
-    );
+  if (fingerprint(landed) !== pageHash) {
+    throw new Error(`${passName}: landed bytes hash differently`);
   }
-  console.log(`${passLabel}: verified ${target} (${landed.length} bytes)`);
 }
 
-async function main(): Promise<void> {
-  const source = findSourceImage();
-  const original = await readFile(source);
-  const fingerprint = sha256(original);
+function deliver(): void {
+  const sourcePath = locatePage();
+  const pageBytes = readFileSync(sourcePath);
+  const pageHash = fingerprint(pageBytes);
 
-  const outDir = resolveOutputDir();
-  await mkdir(outDir, { recursive: true });
-  const target = join(outDir, IMAGE_NAME);
+  const folder = outputFolder();
+  mkdirSync(folder, { recursive: true });
+  const target = join(folder, PAGE_FILE);
 
-  console.log(`source: ${source}`);
-  console.log(`image:  ${original.length} bytes, sha256 ${fingerprint}`);
-  console.log(`output: ${target}`);
-
-  // Two full copies, each verified after it lands. The harness reads
-  // the file only after this program exits, so what it grades is the
-  // second, proven-identical copy.
-  await copyAndVerify(source, target, fingerprint, original.length, "copy 1/2");
-  await copyAndVerify(source, target, fingerprint, original.length, "copy 2/2");
-
-  // Belt and braces: re-read the committed source one last time. If
-  // its fingerprint moved during the run, the copies above may have
-  // raced a changing file — fail rather than grade a moving target.
-  const sourceNow = await readFile(source);
-  if (sha256(sourceNow) !== fingerprint) {
-    throw new Error("source entry.png changed during delivery; aborting");
+  // Never deliver on top of the committed page itself: if the output
+  // folder somehow resolves to the repository, writing there would
+  // destroy the very artifact being verified. Refuse instead.
+  if (resolve(target) === resolve(sourcePath)) {
+    throw new Error(
+      `output path ${target} is the committed page; refusing to overwrite it`,
+    );
   }
 
+  // Two complete writes from the same in-memory buffer, each one
+  // verified after it lands; the second verified write is final.
+  writeAndProve(pageBytes, pageHash, target, "first write");
+  writeAndProve(pageBytes, pageHash, target, "second write");
+
   console.log(
-    `delivery complete: entry.png is in place, byte-identical ` +
-      `(sha256 ${fingerprint})`,
+    `delivered entry.png -> ${target} ` +
+      `(${pageBytes.length} bytes, sha256 ${pageHash}, verified twice)`,
   );
 }
 
-main().catch((err: unknown) => {
-  console.error("delivery failed:", err instanceof Error ? err.message : err);
+try {
+  deliver();
+} catch (err) {
+  console.error(
+    `delivery failed: ${err instanceof Error ? err.message : String(err)}`,
+  );
   process.exit(1);
-});
+}
